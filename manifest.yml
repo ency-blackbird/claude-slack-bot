@@ -1,13 +1,13 @@
 display_information:
-  name: claude-cc
+  name: skunk
   description: Claude Code, driven from Slack
 features:
   bot_user:
-    display_name: claude-cc
+    display_name: skunk
     always_online: true
   slash_commands:
     - command: /list
-      description: Repost the pinned session index
+      description: Re-pin active sessions
       should_escape: false
 oauth_config:
   scopes:

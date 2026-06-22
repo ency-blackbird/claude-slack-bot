@@ -24,7 +24,7 @@ it. A pinned message indexes active sessions.
 
 ## 2. Create the channel and gather IDs
 
-1. Create (or pick) a channel, e.g. `#claude`. Invite the bot: `/invite @claude-cc`.
+1. Create (or pick) a channel, e.g. `#claude`. Invite the bot: `/invite @skunk`.
 2. Channel ID: open the channel → click its name → bottom of the popover shows
    the ID (`C…`). Or right-click the channel → Copy link; the ID is the last path segment.
 3. Your user ID: click your avatar → Profile → ⋯ → **Copy member ID** (`U…`).
@@ -52,7 +52,7 @@ Smoke test:
 .venv/bin/python bot.py
 ```
 
-In `#claude`, `@claude-cc` — it should reply that it's here. Then send a plain
+In `#claude`, `@skunk` — it should reply that it's here. Then send a plain
 top-level message like `say hi in one word`. The bot creates a session thread,
 shows a status line while it works, and replies in-thread.
 
