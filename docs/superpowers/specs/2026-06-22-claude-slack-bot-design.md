@@ -1,113 +1,124 @@
-# claude-slack-bot — v1 design (tight core)
+# claude-slack-bot — design (v2)
 
 **Date:** 2026-06-22
-**Status:** approved design, pre-implementation
-**Relationship:** sibling fork of `claude-tg-bot`. Shares conceptual core (`Session`, `StatusBar`, `ReplyOnce`, `sessions.json`), rewrites the transport + formatting + routing for Slack. Not a shared codebase — deliberate fork to avoid a leaky transport abstraction for a single-user tool.
+**Status:** design under revision (v1 tight-core code already on `main`; this v2 supersedes it and adds the pins/worktree/✅ model)
+**Relationship:** sibling fork of `claude-tg-bot`. Shares conceptual core (`Session`, `StatusBar`, `ReplyOnce`, `sessions.json`), rewrites the transport + formatting + routing for Slack. Deliberate fork — no shared transport abstraction for a single-user tool.
+
+> **History:** v1 (tight core) is built and committed (mrkdwn formatter, Session model, routing, simplified turn loop, StatusBar, `.cancel/.plan/.auto`, a custom pinned *index message*, restart-resume). v2 below revises the navigation model (native pins instead of the custom index), adds ✅-reaction cleanup, the worktree flow, and a merge-aware GC. Differences from the built code are called out as **[CHANGE]**.
 
 ## Goal
 
-A Slack bot that wraps Claude Code via the Agent SDK, giving a phone-friendly interface to multiple parallel Claude conversations. Single-user (per install), long-lived Python process on macOS. Lives in one dedicated Slack channel (`#claude`) that doubles as a demo surface — others can watch, only the owner can drive.
+A single-user Slack bot wrapping Claude Code via the Agent SDK. One channel (`#claude`) is the control surface; each top-level message starts a Claude session bound to its thread. The channel doubles as a demo surface — others can watch, only the owner drives.
 
-## Core model: channel + threads-as-sessions
+## Core interaction model
 
 ```
-#claude  (one channel)
+📌 Pinned panel  =  live sessions   (each pin is YOUR raw message; shows your prompt text)
 │
-├─ 📌 pinned: SESSION INDEX  →  🟢 add-tests · 🟡 refactor-auth · ⚪ scratch   (clickable permalinks)
-│
-├─ ▸ root msg "🟢 add-tests"          ← thread_ts = session key
-│     └─ user: "add a test for X"
-│     └─ bot: [StatusBar] then reply (in-thread)
-│
-└─ ▸ root msg "🟡 refactor-auth"
-      └─ user: "what's left?"
-      └─ bot: reply (in-thread)
+your raw top-level message  ──────────  ← thread root + session key (thread_ts); AUTO-PINNED
+   └─ 🟢 status/header   (bot's first in-thread reply — bot-owned, editable: busy, repo, branch)
+   └─ bot response …      (all bot output threads under your message)
+   └─ bot response …
+   └─ you reply           → continues the session
+✅ react on the raw message  → DONE: unpin + remove worktree + disconnect session
+
+channel history  =  everything + where you start new sessions
 ```
 
-- **A thread = a session.** Routing key is `thread_ts` (analog of Telegram's `message_thread_id`).
-- **Talk to a session** = reply in its thread.
-- **Pinned session index** = the `/list` analog; always visible, one tap into any session via `chat.getPermalink`.
+- **A thread = a session.** Routing key is `thread_ts` (the root message's `ts`). Thread replies route to `sessions[thread_ts]`.
+- **All bot output threads under your raw message** (existing `ReplyOnce`/StatusBar behavior — every send carries `thread_ts`).
+- **Navigation is the native pinned-items panel, not a custom message. [CHANGE]** On session creation the bot pins your raw root message (`pins.add`). The panel becomes the always-one-tap-from-the-input live-session list. The custom `refresh_index`/`index_ts` machinery from v1 is **removed**.
+- **Status lives inside the thread, not in the pin.** Bots can't edit a user's message, so the pin shows your prompt text (fine — readable "what is this"). The bot's first in-thread reply is an editable header showing 🟢 idle / 🟡 busy and, once isolated, the repo + `slack/<branch>`.
 
-## Session creation, naming, cwd
+## Done = ✅ reaction
 
-- **Creation gesture:** a plain top-level (non-threaded, non-command) message in `#claude`. The bot creates a session rooted at that message's `ts` (becomes `thread_ts`), treats the message text as the first prompt, and replies in-thread.
-- **Naming:** auto-generated from a slug of the first few words of the creating message. Shown in the pinned index. (No rename in v1.)
-- **cwd:** **every session uses `DEFAULT_CWD = ~/Developer/blackbird/official-repos`.** No per-session pinning. The cwd is a starting context, not a boundary — Claude Code has full tool access and works across all repos underneath the parent, which directly serves the user's parallel + cross-repo workflow. Per-repo `CLAUDE.md`/`CLAUDE.local.md` is picked up as Claude works inside a given repo.
+- Subscribe to `reaction_added`. When `reaction == "white_check_mark"`, `user == ALLOWED_USER_ID`, and `item.ts` is a known session key:
+  1. `pins.remove` the root message
+  2. `git worktree remove` the session's worktree (if any; branch kept as PR source)
+  3. `disconnect()` the `ClaudeSDKClient` and drop it from `sessions` (history stays resumable via persisted `session_id`)
+- A ✅ on a *reply* (not the root) carries the reply's ts, not the thread's — **ignored** in v1 (don't resolve parents).
+- `reaction_removed` (un-✅) does **not** reopen the session in v1.
 
-## Command surface (v1)
+## Worktree flow (opt-in, Seam B — spike-proven)
+
+**Default: sessions run in `official-repos` with no worktree** (cwd = `DEFAULT_CWD`, `acceptEdits`). Good for exploration, cross-repo work, and quick edits. Discipline for shared trees: one writer per repo at a time.
+
+**`.worktree <repo>`** (in-thread) isolates the session into a feature worktree:
+1. `git worktree add ~/Developer/blackbird/.worktrees/<repo>__<session> -b slack/<session>` off `official-repos/<repo>`
+2. respawn the session's client: `disconnect()` the old one, build a new `ClaudeSDKClient(options=ClaudeAgentOptions(cwd=<worktree>, resume=<session_id>, permission_mode=<mode>))`, `connect()`, update `sess.cwd`
+3. update the in-thread header to show the repo + branch
+
+Respawn only happens **between turns** (session idle), so no in-flight turn is disrupted. If busy, defer with a "wait for the current turn" notice.
+
+**Spike findings (verified 2026-06-22, both reproduced on a throwaway repo+worktree):**
+- Resume into a *different* cwd **preserves conversation continuity** (recalled a planted token across the respawn).
+- `session_id` is **unchanged** — no fork.
+- New turns append to the session's **birth bucket** (`~/.claude/projects/<birth-cwd-key>/<id>.jsonl`), **not** the worktree's bucket — so no phantom jsonl / drift (the tg-bot's drift bug does not apply to plain resume-with-new-cwd).
+- The agent's **tools run in the resume cwd**: `pwd` reported the worktree and a written file landed in the worktree, not the original repo.
+- Consequence: a terminal `cresume` must use the birth cwd (`official-repos`) to find the transcript. Irrelevant to the bot.
+
+This is why isolation is *opt-in at the point you decide it's feature work*, not forced on every session — matches the "chat before code" workflow without taxing small changes.
+
+## Sustainability / cleanup
+
+- **Disk reality:** worktrees share `.git/objects` (history not duplicated) — cheap. The real cost is **`node_modules` / build artifacts per worktree** (hundreds of MB each, not shared). Worktree sprawl hurts via these, not git. Mitigation = aggressive GC; optional future: share/symlink `node_modules`.
+- **Pin cap:** Slack allows 100 pinned items per channel. The ✅-to-unpin discipline keeps the panel (and worktree count) bounded — that's the forcing function.
+- **Merge-aware GC — `/gc` (slash command):** scans `slack/*` branches; for each whose PR is merged (`gh pr list --state merged` and/or `git branch --merged origin/main`), `git worktree remove` + `git branch -d`. Cleanup tracks **merge reality**, not memory. Manual in v1; a scheduled poller is a deferred option. The GC `log()`s what it reaps and skips (no silent truncation).
+
+## Bumping older threads
+
+- **Slack has no API to reorder/move a channel message.** Threads don't float on reply (without broadcast).
+- **Pins solve discovery:** the pinned panel is one tap from the input regardless of scroll position, so "buried in scroll" stops mattering — you navigate by panel, not by scrolling.
+- **Recency ordering within the panel — LIVE TEST REQUIRED:** *if* pinned items order by pin-time, then "bump on activity" = `pins.remove` + `pins.add` to float a session to the top. *If* they order by message-time, re-pinning won't move them (panel stays a stable findable list). Confirm pin ordering on first live run before building bump-on-activity.
+- **Escape hatch:** a thread reply with `reply_broadcast=true` drops a copy at the channel bottom — opt-in "ping me in-channel when this turn finishes."
+
+## Command surface
 
 | Trigger | Where | Effect |
 |---|---|---|
-| top-level message | channel | create new session, first prompt = message text |
-| thread reply | in-thread | route message to that thread's session |
-| `.cancel` | in-thread | interrupt the session's current turn (`client.interrupt()`) |
-| `.plan` | in-thread | switch session to plan permission mode |
-| `.auto` | in-thread | switch session to acceptEdits permission mode |
-| `/list` | slash (global) | repost / refresh the pinned session index |
+| top-level message | channel | create session (auto-named, auto-pinned), prompt = message; bot replies in-thread |
+| thread reply | in-thread | continue that session |
+| `.cancel` | in-thread | interrupt current turn |
+| `.plan` / `.auto` | in-thread | switch permission mode |
+| `.worktree <repo>` | in-thread | isolate session into a feature worktree (resume-into-worktree) |
+| ✅ on root message | reaction | done: unpin + remove worktree + disconnect |
+| `/gc` | slash | reap worktrees/branches whose PRs are merged |
 
-**Why the slash-vs-dot split:** Slack native slash commands do **not** carry `thread_ts` in their payload, so a slash command typed in a thread can't tell the bot which session it targets. Per-session controls therefore ride in as ordinary in-thread messages with a `.` prefix — the message event *does* include `thread_ts`. Global, thread-agnostic actions (`/list`) stay as real slash commands.
+Per-session controls are in-thread `.`-prefixed messages (slash commands lack `thread_ts`). Only thread-agnostic actions (`/gc`) are real slash commands.
 
 ## Architecture
 
-- **Transport:** `slack_bolt` in **Socket Mode** (`SLACK_APP_TOKEN`). No public URL / webhook — the direct analog of Telegram long-polling, ideal for a Mac at home. Interactive components (if added later) also work over Socket Mode with no extra infra.
-- **Concurrency:** Bolt async app; handlers must not block other sessions during a long Claude turn (analog of PTB `concurrent_updates(True)`).
-- **Routing:** `(channel_id, thread_ts) → Session`. A message with no `thread_ts` (or whose `thread_ts == its own ts`) in `#claude` is a creation event.
-- **Allowlist:** the bot obeys only `ALLOWED_USER_ID`. Messages from any other user are ignored (logged, not acted on) — they can watch but not drive. Load-bearing because the bot runs Claude Code with full access to the host.
+- **Transport:** `slack_bolt` async + `AsyncSocketModeHandler` (no public URL). Needs `SLACK_BOT_TOKEN` (`xoxb-`) + `SLACK_APP_TOKEN` (`xapp-`, `connections:write`). Requires `aiohttp` (no `[async]` extra in current `slack_bolt`).
+- **Concurrency:** the `message` handler dispatches each turn via `asyncio.create_task` and returns immediately, so a long turn never blocks other sessions. Same-session ordering stays safe: the `busy` check-and-set in `drive_session` is atomic under asyncio (no `await` between them).
+- **Allowlist:** acts only on `ALLOWED_USER_ID` in `CLAUDE_CHANNEL_ID`. Load-bearing — the bot runs Claude Code with full host access.
+- **Persistence:** `sessions.json` holds `{name, cwd, mode, model, session_id, channel_id, thread_ts, worktree?}` per session (only those with a captured `session_id`). On startup, `restore_sessions()` rebuilds each by resuming its `session_id` (with its persisted cwd — including a worktree cwd). **[CHANGE]** add `worktree` path field; drop `index_ts`.
 
-## Reused conceptual units (ported, not shared code)
+## Reused / rewritten / cut
 
-- **`Session`** dataclass — fields: `name`, `cwd`, `client` (`ClaudeSDKClient`), `mode`, `model`, `busy`, `session_id`, `thread_ts`, `channel_id`, `pending_prompts` (FIFO for messages received while busy). Drops Telegram-only fields (`topic_id`, mirror/marker fields, chief fields).
-- **`StatusBar`** — a message posted at turn start (`chat.postMessage`), updated with `📖 reading X` / `🛠️ running Y` via `chat.update` as tool calls fire, deleted (`chat.delete`) when real assistant text begins. Debounced ≥1s/edit for Slack rate limits.
-- **`ReplyOnce`** — first bot message of a turn anchors the thread; subsequent messages in the same turn post in-thread without re-quoting.
-- **`sessions.json`** — same JSON-file persistence. Persists `session_id`, `cwd`, `mode`, `model`, `thread_ts`, `channel_id`, `name` per session so the bot resumes after restart. Conversation history stays owned by Claude Code in `~/.claude/projects/<cwd-hash>/<session_id>.jsonl`.
+- **Reused conceptually:** `Session`, `StatusBar` (the in-thread editable header), `ReplyOnce`, `sessions.json`.
+- **Rewritten for Slack:** transport (Socket Mode), formatter (`to_mrkdwn` — fenced code stashed first, then headers→bold, links→`<url|text>`, `**`→`*`; unit-tested), routing on `thread_ts`/`channel_id`.
+- **Cut from this milestone (future):** jsonl terminal-mirror / `/respawn` / `/sync`; `/adopt`, `/digest`, `/todo`, `/move`, `/btw`, `/cc`; chief orchestration; rename; PR-create-on-✅ (could fold into the ✅ hook later); scheduled GC; `node_modules` sharing; `reply_broadcast` auto-ping. Visual-block `.txt` hack intentionally dropped (Slack renders monospace fine).
 
-## Rewritten for Slack
-
-- **Formatter: Telegram MDV2 → Slack `mrkdwn`.** `*bold*` (single asterisk), `_italic_`, `~strike~`, `` `code` ``, ```` ```block``` ````, `>quote`, `<url|text>` links. No headers (render as bold). Plain-text fallback per chunk on failure. This is the largest single chunk of work.
-- **Message chunking:** split long output at ~3500 chars (Slack soft-splits above 4000).
-- **Slash command + event registration** via the Slack app manifest, replacing PTB `CommandHandler`.
-
-## Explicitly cut from v1 (future work)
-
-- **jsonl terminal-mirror** + `/respawn` + `/sync` — the phantom-re-render saga. v1 persists `session_id` for restart-resume only; it does not reflect terminal-driven turns into Slack.
-- **Visual-block `.txt` attachment hack** — dropped. Slack renders ```` ``` ```` monospace fine cross-platform (including iOS), so the QuickLook workaround is unnecessary. `files_upload_v2` as a snippet is the future escape hatch if ever needed.
-- **`/adopt`, `/digest`, `/todo`, `/move`, `/btw`, `/cc`, `/respawn`, `/sync`, `/deep`, `/fast`** — Telegram parity commands, deferred.
-- **Chief-of-staff orchestration** (spawn/peek/send worker sessions) — deferred.
-- **Per-session cwd / `.cd` / repo-picker** — deliberately omitted; the single official-repos cwd covers the stated workflow.
-- **Rename / `.name`** — deferred.
-
-## Secrets / config (`.env`)
+## Config / scopes
 
 ```
-SLACK_BOT_TOKEN=xoxb-...        # bot token
-SLACK_APP_TOKEN=xapp-...        # Socket Mode app-level token
-ALLOWED_USER_ID=U...            # only this Slack user can drive the bot
-CLAUDE_CHANNEL_ID=C...          # the #claude channel
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+ALLOWED_USER_ID=U...
+CLAUDE_CHANNEL_ID=C...
 DEFAULT_CWD=/Users/noahchun/Developer/blackbird/official-repos
 ```
+**Bot scopes:** `chat:write`, `commands`, `channels:history`, `channels:read`, `pins:write`, `reactions:read`, `groups:history`, `groups:read`. **[CHANGE]** add `reactions:read`.
+**Events:** `message.channels`, `message.groups`, `app_mention`, `reaction_added` (and optionally `reaction_removed`). **[CHANGE]** add reaction events.
+**Socket Mode** on; app-level token with `connections:write`.
 
-**Required scopes:** `chat:write`, `commands`, `channels:history`, `channels:read`, `pins:write` (and `groups:*` equivalents if the channel is private). **Socket Mode** enabled with an app-level token carrying `connections:write`.
+## Open questions to resolve on first live run
 
-## Hosting
+1. **Pin ordering** — pin-time or message-time? Decides whether bump-on-activity (unpin+repin) is buildable.
+2. **`reaction_added` payload** — confirm `item.ts` equals the root `thread_ts` for a root-message reaction.
+3. **Pin/unpin channel noise** — does the "pinned a message" system line bother the workspace enough to switch to `bookmarks` instead of pins?
+4. **`.worktree` while `<repo>` is dirty / branch exists** — fallback path (the tg-bot retries `worktree add` without `-b` when the branch already exists).
 
-Same Mac. A launchd plist ported from `claude-tg-bot`'s template keeps it alive across reboot/crash. `requirements.txt`: `slack_bolt`, `claude-agent-sdk`, `python-dotenv`.
+## Hosting & file map
 
-## File map (target)
-
-- `bot.py` — main, single file (right-sized for one user; don't split until a seam breaks)
-- `sessions.json` — runtime state (gitignored)
-- `.env` / `.env.example`
-- `requirements.txt`
-- `restart.sh` — ported bouncer
-- `claude-slack-bot.plist.template` — launchd template
-- `SETUP.md`
-- `CLAUDE.md` — project brief + Slack-specific gotchas
-
-## Known Slack gotchas to capture in CLAUDE.md during build
-
-- Slash commands don't carry `thread_ts` → per-session controls must be in-thread messages, not slash commands.
-- `chat.postMessage` is rate-limited ~1 msg/sec/channel; `chat.update` is tier-3 → debounce StatusBar edits.
-- Socket Mode needs both a bot token (`xoxb-`) and an app-level token (`xapp-`).
-- `mrkdwn` ≠ Markdown: single-asterisk bold, no headers, `<url|text>` link syntax.
-- Shared-workspace privacy is app-layer only via `ALLOWED_USER_ID`; the bot is otherwise visible to everyone in the channel.
-```
+Same Mac; launchd plist (ported). `bot.py` single file. `requirements.txt`: `slack_bolt`, `aiohttp`, `claude-agent-sdk`, `python-dotenv`. `manifest.yml`, `restart.sh`, `claude-slack-bot.plist.template`, `tests/test_mrkdwn.py`, `SETUP.md`, `CLAUDE.md`.
