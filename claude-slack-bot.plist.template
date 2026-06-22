@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job to auto-start the bot on login and respawn on crash.
+
+  To install:
+    1. Replace __USER__ with your macOS username (`whoami`)
+    2. Replace __BOT_DIR__ with the absolute path to your claude-slack-bot clone
+       (e.g., /Users/alice/Developer/general/claude-slack-bot)
+    3. Copy to ~/Library/LaunchAgents/ with a unique label:
+         cp claude-slack-bot.plist.template ~/Library/LaunchAgents/com.<yourname>.claude-slack-bot.plist
+       (update the <Label> below to match the filename, minus .plist)
+    4. Load it:
+         launchctl load ~/Library/LaunchAgents/com.<yourname>.claude-slack-bot.plist
+    5. Stop / unload later with:
+         launchctl unload ~/Library/LaunchAgents/com.<yourname>.claude-slack-bot.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.__USER__.claude-slack-bot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BOT_DIR__/.venv/bin/python</string>
+    <string>__BOT_DIR__/bot.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__BOT_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/__USER__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/__USER__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- KeepAlive: respawn on crash, but don't fight intentional shutdowns -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <!-- Wait 10s between restart attempts so a bug at startup doesn't spin -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__BOT_DIR__/bot.log</string>
+  <key>StandardErrorPath</key>
+  <string>__BOT_DIR__/bot.err.log</string>
+</dict>
+</plist>
