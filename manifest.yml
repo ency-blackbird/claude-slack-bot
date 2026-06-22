@@ -1,0 +1,31 @@
+display_information:
+  name: claude-cc
+  description: Claude Code, driven from Slack
+features:
+  bot_user:
+    display_name: claude-cc
+    always_online: true
+  slash_commands:
+    - command: /list
+      description: Repost the pinned session index
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+      - channels:history
+      - channels:read
+      - pins:write
+      - groups:history
+      - groups:read
+settings:
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - app_mention
+  org_deploy_enabled: false
