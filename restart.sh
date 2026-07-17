@@ -38,9 +38,18 @@ fi
 (
     nohup bash -c "
         sleep $DELAY
-        pkill -f '$BOT_DIR/bot.py' 2>/dev/null
-        pkill -f 'Python bot.py' 2>/dev/null
+        # Kill by discovered PID, not 'pkill -f <pattern>'. On macOS the running
+        # bot is 'homebrew-python bot.py'; the interpreter path has no 'bot' in
+        # it and pgrep/pkill -f can't reliably see the 'bot.py' argv — so the old
+        # pattern matched NOTHING and we'd start a 2nd instance (double Socket
+        # Mode → duplicate events). 'ps -o command' DOES show the argv, and only
+        # the bot's line contains ' bot.py' (SDK child processes do not).
+        pids=\$(ps ax -o pid=,command= | grep -F ' bot.py' | grep -v grep | awk '{print \$1}')
+        [ -n \"\$pids\" ] && kill \$pids 2>/dev/null
         sleep 2
+        pids=\$(ps ax -o pid=,command= | grep -F ' bot.py' | grep -v grep | awk '{print \$1}')
+        [ -n \"\$pids\" ] && kill -9 \$pids 2>/dev/null
+        sleep 1
         cd '$BOT_DIR'
         exec '$PYTHON' bot.py >> '$LOG' 2>&1
     " </dev/null >/dev/null 2>&1 &
