@@ -63,6 +63,70 @@ EXTRA_HOME_CHANNELS: set[str] = {
 }
 HOME_CHANNELS: frozenset[str] = frozenset({CLAUDE_CHANNEL_ID, *EXTRA_HOME_CHANNELS})
 
+# Per-channel profile: where a new session lands (`cwd`) and the behavioral
+# posture appended to the system prompt (`purpose`) so a fresh session knows
+# what the channel is FOR. This is the ONLY thing that tells Claude which
+# channel it's in — the subprocess can't otherwise distinguish them
+# (CLAUDE_CHANNEL_ID is static regardless of the originating channel). Channels
+# not listed fall back to a neutral profile (DEFAULT_CWD, no posture). If a
+# profile's cwd doesn't exist on this host, session creation falls back to
+# DEFAULT_CWD. Edit freely — the purpose strings are plain guidance.
+CHANNEL_PROFILES: dict[str, dict[str, str]] = {
+    "C0BGP214VGU": {  # #infra
+        "name": "infra",
+        "cwd": os.path.expanduser("~/Developer/general/claude-slack-bot"),
+        "purpose": (
+            "You are in the #infra channel. Scope: building and maintaining THIS "
+            "harness — the claude-slack-bot code (your cwd) and the Claude Code "
+            "config under ~/.claude (settings, hooks, commands, skills, MCP). Work "
+            "here is self-modifying and can affect how the owner reaches you at all: "
+            "prefer small, reversible changes, back up and validate config before "
+            "saving, and remember that editing bot.py requires a restart "
+            "(./restart.sh) that briefly interrupts this channel."
+        ),
+    },
+    "C0BGP29BXPW": {  # #fixes
+        "name": "fixes",
+        "cwd": DEFAULT_CWD,
+        "purpose": (
+            "You are in the #fixes channel. Scope: quick, small asks — fast fixes to "
+            "already-merged PRs or shipped features, one-off queries to run, and small "
+            "Slack requests. Bias HARD toward the smallest change that works; assume "
+            "tasks are trivial-to-medium and self-contained. Skip plan mode and "
+            "architecture unless the task clearly grows. Ship fast."
+        ),
+    },
+    "C0BCDRTHUC9": {  # #main
+        "name": "main",
+        "cwd": os.path.expanduser("~/Developer/blackbird"),
+        "purpose": (
+            "You are in the #main channel. Scope: serious work in the Blackbird repos "
+            "(cwd ~/Developer/blackbird) — big ideas, ideation, and large PRs. The "
+            "Blackbird employee rules apply most here: defensible PRs over clever ones, "
+            "bias smaller, surface and work within existing design docs before proposing "
+            "reframes, and check CLAUDE.local.md conventions in any repo you touch. "
+            "Bring rigor — plan large changes and front-load unknowns."
+        ),
+    },
+    "C0BGG2BGSTF": {  # #side-projects
+        "name": "side-projects",
+        "cwd": os.path.expanduser("~/Developer/personal"),
+        "purpose": (
+            "You are in the #side-projects channel. Scope: fun, personal projects — no "
+            "real direction needed. Keep it light: minimal ceremony, no heavy process, "
+            "optimize for momentum and enjoyment over rigor."
+        ),
+    },
+}
+
+
+def profile_for(channel_id: str) -> dict[str, str]:
+    """cwd + posture for a channel; neutral fallback for unlisted channels."""
+    return CHANNEL_PROFILES.get(
+        channel_id, {"name": "", "cwd": DEFAULT_CWD, "purpose": ""}
+    )
+
+
 STATE_FILE = Path(__file__).resolve().parent / "sessions.json"
 SLACK_CHUNK = 3500  # Slack soft-splits text above ~4000 chars
 
@@ -125,11 +189,21 @@ sessions: dict[str, Session] = {}  # keyed by thread_ts
 def make_client(
     cwd: str, mode: str, *, channel_id: str, thread_ts: str,
     resume_session_id: str | None = None, model: str | None = None,
+    purpose: str = "",
 ) -> ClaudeSDKClient:
     opts = ClaudeAgentOptions(
         cwd=cwd,
         permission_mode=mode,
         can_use_tool=make_can_use_tool(channel_id, thread_ts),
+        # Channel posture is APPENDED to Claude Code's default system prompt via
+        # the preset form — a bare `system_prompt=str` would REPLACE the whole
+        # prompt and strip every default tool/skill. Empty purpose → pass None
+        # to leave the default untouched (identical to prior behavior).
+        system_prompt=(
+            {"type": "preset", "preset": "claude_code", "append": purpose}
+            if purpose
+            else None
+        ),
         # Enable Claude Code Artifacts. The bundled CLI turns artifacts OFF by
         # default for SDK entrypoints (CLAUDE_CODE_ENTRYPOINT=sdk-py); setting
         # CLAUDE_CODE_ARTIFACT truthy overrides that sdk-default-off gate.
@@ -617,11 +691,14 @@ async def _route(client, event: dict) -> None:
             return
 
         name = slugify(text)
+        prof = profile_for(channel)
+        cwd = prof["cwd"] if os.path.isdir(prof["cwd"]) else DEFAULT_CWD
         sess = Session(
             name=name,
-            cwd=DEFAULT_CWD,
+            cwd=cwd,
             client=make_client(
-                DEFAULT_CWD, "default", channel_id=channel, thread_ts=ts,
+                cwd, "default", channel_id=channel, thread_ts=ts,
+                purpose=prof["purpose"],
             ),
             channel_id=channel,
             thread_ts=ts,
@@ -629,8 +706,8 @@ async def _route(client, event: dict) -> None:
         await sess.client.connect()
         sessions[ts] = sess
         log.info(
-            "created session %s rooted at thread_ts=%s (channel=%s, home=%s)",
-            name, ts, channel, is_home,
+            "created session %s rooted at thread_ts=%s (channel=%s, home=%s, cwd=%s)",
+            name, ts, channel, is_home, cwd,
         )
         await pin_root(client, channel, ts)
         await drive_session(client, sess, text)
@@ -736,6 +813,7 @@ async def restore_sessions() -> None:
                 sd["cwd"], mode,
                 channel_id=sd["channel_id"], thread_ts=ts,
                 resume_session_id=sd.get("session_id"), model=sd.get("model"),
+                purpose=profile_for(sd["channel_id"])["purpose"],
             )
             await c.connect()
             sessions[ts] = Session(

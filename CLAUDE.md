@@ -13,10 +13,10 @@ thread) are rewritten. See `docs/superpowers/specs/` for the design and
 ## Core model
 
 - **Session** — one `ClaudeSDKClient`. Keyed by `thread_ts` in `sessions: dict[str, Session]`. Persists across restarts via `session_id` captured from the first `SystemMessage`; written to `sessions.json` and resumed on startup (`restore_sessions`).
-- **Channel = control surface.** One channel (`CLAUDE_CHANNEL_ID`). A top-level (non-threaded, non-command) message creates a session rooted at its `ts`; thread replies route to `sessions[thread_ts]`.
+- **Channel = control surface.** The bot lives in several home channels (`HOME_CHANNELS`); in any of them a top-level (non-threaded, non-command) message creates a session rooted at its `ts`, and thread replies route to `sessions[thread_ts]`. In non-home channels an explicit @-mention is required to start one.
 - **Pinned session index** — a single channel message (`index_ts`) listing active sessions as clickable permalinks (🟢 idle / 🟡 busy). The `/list` analog; refreshed on session create and on each turn's start/end.
 - **StatusBar** — a thread message posted at turn start, updated with `📖 reading X` / `🛠️ running Y` via `chat.update`, deleted when real assistant text begins. Debounced ≥1s/edit.
-- **cwd** — every session uses `DEFAULT_CWD`, defaulting to `~` (the code fallback at `bot.py:47` when the env var is unset). The cwd is a starting context, not a boundary: full tool access works across everything underneath. No per-session cwd in v1 by design.
+- **cwd + channel posture** — each channel has a profile (`CHANNEL_PROFILES`) giving new sessions a landing `cwd` and a `purpose` string appended to Claude Code's default system prompt (preset+append, never replacing it). #infra → the harness repo, #main → `~/Developer/blackbird`, #fixes → `DEFAULT_CWD`, #side-projects → `~/Developer/personal`. Unlisted channels fall back to `DEFAULT_CWD` (defaults to `~`) with no posture; a profile whose cwd is missing on the host also falls back. cwd is a starting context, not a boundary — full tool access works across everything underneath. Posture is re-derived from the channel on restart, never persisted to `sessions.json`.
 
 ## Command surface
 
