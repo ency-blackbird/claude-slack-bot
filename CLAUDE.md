@@ -36,6 +36,29 @@ thread) are rewritten. See `docs/superpowers/specs/` for the design and
 - **Privacy is app-layer only** via `ALLOWED_USER_ID`. On a shared workspace the bot is visible to everyone in the channel; they can watch but only the owner drives. The allowlist is load-bearing — the bot runs Claude Code with full host access.
 - **`session_id` is captured from the first `SystemMessage`** as `getattr(msg, "session_id", None) or (msg.data or {}).get("session_id")`. Only persisted sessions (those with an id) survive restart.
 
+## Restarting (Claude may do this autonomously)
+
+The owner has granted standing agency to restart the bot when a change requires
+it — **don't ask first** (granted 2026-07-20). Restart when you've committed a
+change to `bot.py` or other loaded harness code that needs a reload; skip it for
+doc-only or unrelated changes.
+
+- **How:** `./restart.sh <delay>` from the repo, e.g. `./restart.sh 15`. It kills
+  the running bot by discovered PID and relaunches, detached — safe to run from
+  *inside* the bot's own session (it survives its own SIGHUP).
+- **Reply BEFORE you trigger it.** The restart terminates the current session
+  (you are a child of `bot.py`), so post your message first, then call
+  `./restart.sh 15` as the last action — the delay lets the reply land before the
+  bounce. Persisted sessions resume on startup via `restore_sessions`.
+- **Don't use `pkill -f` yourself.** On macOS the bot runs as homebrew-python
+  with `bot.py` as a relative argv the pattern can't see — that's why `restart.sh`
+  discovers the PID via `ps -o command | grep ' bot.py'` instead.
+- **Verify after:** `grep "starting claude-slack-bot" bot.log | tail -1` shows a
+  fresh timestamp, and `ps ax -o pid=,command= | grep -F ' bot.py' | grep -v grep`
+  shows exactly one homebrew-python instance (extra matches under `.venv/…/claude`
+  are transient SDK subprocesses, fine). You can't verify within the same turn —
+  the restart kills you — so verification happens on the owner's next message.
+
 ## Cut from v1 (future)
 
 jsonl terminal-mirror / `/respawn` / `/sync`; `/adopt`, `/digest`, `/todo`,
