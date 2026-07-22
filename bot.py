@@ -313,13 +313,17 @@ def friendly_verb(name: str, inp: dict | None) -> str:
 # commands a reflexive phone-tap would regret. The gate FAILS CLOSED: if we
 # can't reach the owner (Slack post fails), a dangerous action is denied.
 
-DEVELOPER_ROOT = os.path.realpath(os.path.expanduser("~/Developer"))
+# Writes to absolute paths outside this root are gated for approval; everything
+# inside runs silently. Defaults to ~/Developer — override with WRITE_ROOT in
+# .env if your work lives somewhere else.
+WRITE_ROOT = os.environ.get("WRITE_ROOT", "~/Developer")
+DEVELOPER_ROOT = os.path.realpath(os.path.expanduser(WRITE_ROOT))
 _EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 # Bash command patterns needing approval. Matched case-insensitively (re.search)
 # against the command string. This list IS the security policy — keep it tight
 # and readable; edit freely. Ordinary git push, gradle tests, reads, edits
-# inside ~/Developer, etc. are intentionally NOT here — they run silently.
+# inside WRITE_ROOT, etc. are intentionally NOT here — they run silently.
 _DANGER_BASH_PATTERNS: list[tuple[str, str]] = [
     (r"\brm\b.*(-\w*r|--recursive)", "recursive delete (rm -r)"),
     (r"\bgit\s+push\b.*(--force|--force-with-lease|\s-\w*f)", "git force-push"),
@@ -340,7 +344,7 @@ def danger_match(tool: str, inp: dict | None) -> str | None:
 
     Pure function — this is the unit-tested core of the policy. Bash commands
     are matched against `_DANGER_BASH_PATTERNS`; file writes are gated only when
-    they target an ABSOLUTE path outside ~/Developer (relative paths, which
+    they target an ABSOLUTE path outside WRITE_ROOT (relative paths, which
     Claude rarely emits for writes, are allowed to avoid false gating)."""
     inp = inp or {}
     if tool == "Bash":
@@ -354,7 +358,7 @@ def danger_match(tool: str, inp: dict | None) -> str | None:
         if path and os.path.isabs(path):
             real = os.path.realpath(path)
             if real != DEVELOPER_ROOT and not real.startswith(DEVELOPER_ROOT + os.sep):
-                return f"write outside ~/Developer ({path})"
+                return f"write outside {WRITE_ROOT} ({path})"
     return None
 
 

@@ -24,15 +24,17 @@ it. A pinned message indexes active sessions.
 
 ## 2. Create the channel and gather IDs
 
-1. Create (or pick) a channel, e.g. `#claude`. Invite the bot: `/invite @skunk`.
+1. Create (or pick) a channel, e.g. `#claude`. Invite the bot: `/invite @your-bot` (the name you gave it in the manifest).
 2. Channel ID: open the channel → click its name → bottom of the popover shows
    the ID (`C…`). Or right-click the channel → Copy link; the ID is the last path segment.
 3. Your user ID: click your avatar → Profile → ⋯ → **Copy member ID** (`U…`).
 
-## 3. Configure and run
+## 3. Install deps, configure, and run
 
 ```sh
-cd ~/Developer/general/claude-slack-bot
+cd claude-slack-bot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 ```
 
@@ -41,10 +43,17 @@ Edit `.env`:
 ```
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
-ALLOWED_USER_ID=U...        # only this user can drive the bot
-CLAUDE_CHANNEL_ID=C...
-DEFAULT_CWD=/Users/noahchun/Developer/blackbird/official-repos
+ALLOWED_USER_ID=U...            # only this user can drive the bot
+CLAUDE_CHANNEL_ID=C...          # the bot's primary "home" channel
+DEFAULT_CWD=/Users/you/code     # absolute path where new sessions start (NOT ~-expanded)
+WRITE_ROOT=~/code               # writes outside this tree ask for approval (default: ~/Developer)
 ```
+
+`WRITE_ROOT` is the safety boundary: edits/writes to absolute paths outside it
+pop a ✅/❌ approval button in the thread, while everything inside runs silently.
+Point it at wherever your real work lives (omit it to keep the `~/Developer`
+default). `DEFAULT_CWD` is just where a fresh session lands — give it an absolute
+path, since it is not `~`-expanded.
 
 Smoke test:
 
@@ -52,9 +61,9 @@ Smoke test:
 .venv/bin/python bot.py
 ```
 
-In `#claude`, `@skunk` — it should reply that it's here. Then send a plain
-top-level message like `say hi in one word`. The bot creates a session thread,
-shows a status line while it works, and replies in-thread.
+In your channel, @-mention the bot — it should reply that it's here. Then send a
+plain top-level message like `say hi in one word`. The bot creates a session
+thread, shows a status line while it works, and replies in-thread.
 
 ## Day-to-day
 
@@ -67,8 +76,27 @@ shows a status line while it works, and replies in-thread.
 | `.auto` | in-thread | switch the session back to acceptEdits |
 | `/list` | anywhere in channel | repost/refresh the pinned session index |
 
-Every session runs in `DEFAULT_CWD` (`official-repos`), giving cross-repo access.
-Tell a session which repo to work in as part of your message.
+Every session runs in `DEFAULT_CWD`, giving cross-repo access. Tell a session
+which repo to work in as part of your message.
+
+## (Optional) Multiple channels with distinct postures
+
+The bot can live in several channels at once, each with its own landing
+directory and behavioral "posture" (a system-prompt append that tells a fresh
+session what that channel is FOR). This is configured near the top of `bot.py`:
+
+- `EXTRA_HOME_CHANNELS` — channel IDs (besides `CLAUDE_CHANNEL_ID`) where a plain
+  top-level message starts a session with no @-mention. Anywhere else, the bot
+  stays quiet unless @-mentioned.
+- `CHANNEL_PROFILES` — maps a channel ID to `{name, cwd, purpose}`: where new
+  sessions land and the posture appended to the system prompt. Unlisted channels
+  fall back to `DEFAULT_CWD` with no posture; a profile whose `cwd` is missing on
+  your machine also falls back, so leftover example paths won't break anything.
+
+The committed values are a worked example (four channels: infra / fixes / main /
+side-projects). Swap in your own channel IDs, paths, and purpose text. Channel
+IDs aren't secret, so they live in code for review visibility. Editing `bot.py`
+requires a restart (`./restart.sh`).
 
 ## (Optional) Auto-restart on macOS (launchd)
 
