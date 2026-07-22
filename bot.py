@@ -178,9 +178,13 @@ class Session:
     thread_ts: str  # the session key
     mode: str = "default"  # "default" routes every tool through can_use_tool
     model: str | None = None
-    busy: bool = False
+    busy: bool = False  # a user prompt is in flight, awaiting its ResultMessage
     session_id: str | None = None  # captured from first SystemMessage
     pending_prompts: deque = field(default_factory=deque)
+    # --- live-reader state (see _reader_loop) ---
+    reader_task: "asyncio.Task | None" = None  # sole consumer of the msg stream
+    status: "StatusBar | None" = None  # StatusBar for the in-flight prompt, else None
+    turn_last_activity: float = 0.0  # monotonic; refreshed on every streamed msg (watchdog)
 
 
 sessions: dict[str, Session] = {}  # keyed by thread_ts
@@ -212,6 +216,11 @@ def make_client(
         env={
             "CLAUDE_CODE_ARTIFACT": "1",
             "CLAUDE_CODE_ARTIFACT_AUTO_OPEN": "0",
+            # Main session stays on Opus (settings.json → opus[1m]); route the
+            # cheaper/faster subagent work to the latest Sonnet (currently
+            # Sonnet 5). Verified: this env var repoints built-in subagents
+            # (general-purpose, Explore, …) while the main model is untouched.
+            "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet",
         },
     )
     if resume_session_id:
@@ -506,12 +515,161 @@ class StatusBar:
 # ---------- turn execution ----------
 
 
-async def drive_session(client, sess: Session, text: str) -> None:
-    """Send `text` to `sess` and stream the response into its thread.
+# A turn may stream nothing (no messages, no ResultMessage) for this long before
+# the idle watchdog force-ends it, so a dead/silent turn can't wedge the queue.
+# Refreshed on EVERY streamed message, so a long CI watch that emits periodically
+# never trips it — only a genuinely silent turn does.
+TURN_IDLE_CAP = 600.0  # seconds
+# Respawn backstop: more than this many stream deaths within the window → give up
+# (avoids a crash-loop hammering the API).
+_MAX_RESPAWNS = 3
+_RESPAWN_WINDOW = 60.0  # seconds
 
-    Simplified port of claude-tg-bot's _drive_session: no dangling-tail guard,
-    no jsonl mirror, no retry/respawn (all cut from v1). If the session is
-    busy, the prompt is queued FIFO and drained when the current turn ends.
+
+async def _issue_prompt(sess: Session, text: str) -> None:
+    """Send a user prompt into the session; the reader streams the response.
+
+    `busy=True` is set with NO await before `query()` so the caller's
+    check-and-set stays atomic (no double-issue). The StatusBar starts AFTER the
+    query is on the wire — `query()` only writes to the transport — closing the
+    window where a stray ResultMessage could 'end' a turn that doesn't exist yet.
+    """
+    sess.busy = True
+    sess.turn_last_activity = time.monotonic()
+    try:
+        await sess.client.query(text)
+    except Exception as e:
+        log.exception("query failed for %s", sess.name)
+        sess.busy = False
+        await say_threaded(
+            app.client, sess.channel_id, sess.thread_ts, f"⚠️ couldn't send that: {e}"
+        )
+        return
+    sess.status = StatusBar(app.client, sess.channel_id, sess.thread_ts)
+    await sess.status.start()
+
+
+async def _end_turn(sess: Session) -> None:
+    """End the in-flight prompt: stop its StatusBar, clear busy, drain the queue.
+
+    There is NO await between `busy=False` and the drain's `_issue_prompt` (which
+    sets `busy=True` before its own first await), so a concurrent `_route` can't
+    slip a second prompt in — same atomicity the old finally-drain relied on.
+    """
+    if sess.status is not None:
+        await sess.status.stop()
+        sess.status = None
+    sess.busy = False
+    if sess.pending_prompts:
+        nxt = sess.pending_prompts.popleft()
+        await _issue_prompt(sess, nxt)
+
+
+async def _respawn(sess: Session) -> bool:
+    """Rebuild the session's client after its subprocess died, resuming by id."""
+    try:
+        try:
+            await sess.client.disconnect()
+        except Exception:
+            pass
+        prof = profile_for(sess.channel_id)
+        sess.client = make_client(
+            sess.cwd, sess.mode,
+            channel_id=sess.channel_id, thread_ts=sess.thread_ts,
+            resume_session_id=sess.session_id, model=sess.model,
+            purpose=prof["purpose"],
+        )
+        await sess.client.connect()
+        sess.busy = False
+        sess.status = None
+        log.info("respawned client for %s (resume=%s)", sess.name, (sess.session_id or "?")[:8])
+        return True
+    except Exception:
+        log.exception("respawn failed for %s", sess.name)
+        return False
+
+
+async def _reader_loop(sess: Session) -> None:
+    """Sole consumer of the session's message stream, for the client's life.
+
+    Posts everything the agent emits — prompted replies AND unprompted updates
+    (monitoring / CI watch) — into the session's thread as it arrives. This is
+    what makes output flow live instead of buffering until the next message
+    pokes it, and (one reader ↔ one thread) makes cross-conversation desync
+    structurally impossible. The stream ends only when the subprocess exits
+    (SDK sends its `{"type":"end"}` sentinel once, at teardown) or errors — then
+    we respawn so long-lived watches survive a subprocess hiccup.
+    """
+    respawns: list[float] = []
+    while True:
+        try:
+            async for msg in sess.client.receive_messages():
+                sess.turn_last_activity = time.monotonic()
+                await capture_session_id(msg, sess)
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            if sess.status is not None:
+                                await sess.status.stop()
+                                sess.status = None
+                            await say_threaded(
+                                app.client, sess.channel_id, sess.thread_ts, block.text
+                            )
+                        elif isinstance(block, ToolUseBlock):
+                            if sess.status is not None:
+                                await sess.status.update(
+                                    friendly_verb(block.name, getattr(block, "input", None))
+                                )
+                elif isinstance(msg, ResultMessage):
+                    if sess.busy:
+                        await _end_turn(sess)
+            log.warning("stream ended for %s — will respawn", sess.name)
+        except asyncio.CancelledError:
+            raise  # session closing; propagate so the task ends cleanly
+        except Exception as e:
+            log.exception("reader error for %s: %s", sess.name, e)
+            try:
+                await say_threaded(
+                    app.client, sess.channel_id, sess.thread_ts,
+                    f"⚠️ session stream error: {e}",
+                )
+            except Exception:
+                pass
+        # --- stream died: respawn with backoff + a crash-loop backstop ---
+        now = time.monotonic()
+        respawns = [t for t in respawns if now - t < _RESPAWN_WINDOW]
+        respawns.append(now)
+        if len(respawns) > _MAX_RESPAWNS:
+            log.error("too many respawns for %s — giving up", sess.name)
+            sess.busy = False
+            sess.status = None
+            try:
+                await say_threaded(
+                    app.client, sess.channel_id, sess.thread_ts,
+                    "⚠️ session died and couldn't recover — send a message to restart it.",
+                )
+            except Exception:
+                pass
+            return
+        # First death → recover immediately; only back off on repeated failures.
+        delay = 0.0 if len(respawns) == 1 else min(2 ** (len(respawns) - 1), 15)
+        await asyncio.sleep(delay)
+        if not await _respawn(sess):
+            return
+
+
+def start_reader(sess: Session) -> None:
+    """Spawn the session's reader task (idempotent)."""
+    if sess.reader_task is None or sess.reader_task.done():
+        sess.reader_task = asyncio.create_task(_reader_loop(sess))
+
+
+async def drive_session(client, sess: Session, text: str) -> None:
+    """Route a user prompt to the session: queue it if busy, else issue it.
+
+    Output is delivered by the always-on reader (`_reader_loop`), not here — so
+    responses stream in as they're produced and unprompted updates flow with no
+    poke. The `busy` check-and-set is atomic (no await between them).
     """
     if sess.busy:
         sess.pending_prompts.append(text)
@@ -523,64 +681,26 @@ async def drive_session(client, sess: Session, text: str) -> None:
         except Exception:
             pass
         return
+    await _issue_prompt(sess, text)
 
-    sess.busy = True
-    status = StatusBar(client, sess.channel_id, sess.thread_ts)
-    await status.start()
-    streamed = False
-    started = time.monotonic()
-    seen_blank = False  # SDK emits a blank AssistantMessage before each genuine response
-    try:
-        await sess.client.query(text)
-        async for msg in sess.client.receive_response():
-            await capture_session_id(msg, sess)
-            if isinstance(msg, AssistantMessage):
-                # A "blank" AssistantMessage (no text, no tool use) is the SDK's
-                # streaming placeholder that precedes every genuinely new response.
-                has_text = any(
-                    isinstance(b, TextBlock) and b.text.strip() for b in msg.content
+
+async def _watchdog_loop() -> None:
+    """Force-end any turn silent past TURN_IDLE_CAP so a dead/silent turn can't
+    wedge a thread's queue. Stream activity refreshes `turn_last_activity`, so a
+    healthy long turn (a periodic CI watch) never trips — only a stuck one does.
+    """
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        for sess in list(sessions.values()):
+            if sess.busy and (now - sess.turn_last_activity) > TURN_IDLE_CAP:
+                log.warning(
+                    "turn watchdog fired for %s — force-ending idle turn", sess.name
                 )
-                has_tool = any(isinstance(b, ToolUseBlock) for b in msg.content)
-                if not has_text and not has_tool:
-                    seen_blank = True
-                for block in msg.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        # Dangling-tail guard (ported from claude-tg-bot bot.py:2060).
-                        # Text that arrives BEFORE any blank placeholder, within 2s of
-                        # turn start, is buffered stdout from the PREVIOUS turn's
-                        # subprocess continuation — not a live response to this prompt.
-                        # Absorb it silently so it isn't posted as this message's reply
-                        # (the "reply is to the message above" bug).
-                        if not seen_blank and (time.monotonic() - started) < 2.0:
-                            log.warning(
-                                "DANGLING-SKIP %s: absorbing buffered subprocess tail: %r",
-                                sess.name, block.text[:60],
-                            )
-                            break  # skip the rest of this AssistantMessage
-                        if not streamed:
-                            await status.stop()
-                            streamed = True
-                        await say_threaded(
-                            client, sess.channel_id, sess.thread_ts, block.text
-                        )
-                    elif isinstance(block, ToolUseBlock):
-                        await status.update(
-                            friendly_verb(block.name, getattr(block, "input", None))
-                        )
-            elif isinstance(msg, ResultMessage):
-                break
-    except Exception as e:
-        log.exception("turn failed for %s", sess.name)
-        await status.stop()
-        await say_threaded(
-            client, sess.channel_id, sess.thread_ts, f"⚠️ error: {e}"
-        )
-    finally:
-        await status.stop()
-        sess.busy = False
-        if sess.pending_prompts:
-            nxt = sess.pending_prompts.popleft()
-            await drive_session(client, sess, nxt)
+                try:
+                    await _end_turn(sess)
+                except Exception:
+                    log.exception("watchdog _end_turn failed for %s", sess.name)
 
 
 # ---------- per-session dot-commands ----------
@@ -705,6 +825,7 @@ async def _route(client, event: dict) -> None:
         )
         await sess.client.connect()
         sessions[ts] = sess
+        start_reader(sess)  # begin consuming the stream before we issue the prompt
         log.info(
             "created session %s rooted at thread_ts=%s (channel=%s, home=%s, cwd=%s)",
             name, ts, channel, is_home, cwd,
@@ -739,7 +860,7 @@ async def on_reaction(event, client):
     if event.get("reaction") not in CLOSE_REACTIONS:
         return
     item = event.get("item") or {}
-    if item.get("channel") != CLAUDE_CHANNEL_ID:
+    if item.get("channel") not in HOME_CHANNELS:  # any home channel, not just the primary
         return
     ts = item.get("ts")
     sess = sessions.pop(ts, None)
@@ -747,6 +868,13 @@ async def on_reaction(event, client):
         return
 
     await unpin_root(client, item["channel"], ts)
+    if sess.reader_task is not None:
+        sess.reader_task.cancel()
+        try:
+            await sess.reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        sess.reader_task = None
     try:
         await sess.client.disconnect()
     except Exception as e:
@@ -816,7 +944,7 @@ async def restore_sessions() -> None:
                 purpose=profile_for(sd["channel_id"])["purpose"],
             )
             await c.connect()
-            sessions[ts] = Session(
+            sess = Session(
                 name=sd["name"],
                 cwd=sd["cwd"],
                 client=c,
@@ -826,6 +954,8 @@ async def restore_sessions() -> None:
                 model=sd.get("model"),
                 session_id=sd.get("session_id"),
             )
+            sessions[ts] = sess
+            start_reader(sess)  # resumed session streams live; no poke needed
         except Exception:
             log.exception("failed to restore session %s", sd.get("name"))
     log.info("restored %d sessions", len(sessions))
@@ -844,6 +974,7 @@ async def main() -> None:
         CLAUDE_CHANNEL_ID, ALLOWED_USER_ID, BOT_USER_ID, DEFAULT_CWD,
     )
     await restore_sessions()
+    asyncio.create_task(_watchdog_loop())  # force-end silently-wedged turns
     handler = AsyncSocketModeHandler(app, APP_TOKEN)
     await handler.start_async()
 
